@@ -1,9 +1,53 @@
 import RPi.GPIO as GPIO
+import os
+import json
 import time
 import math
 import Adafruit_DHT
 import datetime
+from AWSIoTPythonSDK.MQTTLib import AWSIoTMQTTClient
+#from config import configs
 
+# Here goes the connection to AWS
+#stage = configs[os.environ.get("STAGE")]
+
+# Parameters
+host = "akelw02gb2zom-ats.iot.us-east-1.amazonaws.com"
+root_ca_path = "/home/pi/Desktop/Programacion/MCP3208/keys/terraform-iot-air-pollution-prod-root-certificate.pem.crt"
+certificate_path = "/home/pi/Desktop/Programacion/MCP3208/keys/terraform-iot-air-pollution-prod.pem.crt"
+private_key_path = "/home/pi/Desktop/Programacion/MCP3208/keys/keys.txt"
+client_id = "air-pollution"
+topic = "topic/air-pollution"
+location = "home"
+
+# Custom MQTT message callback
+def on_message(client: AWSIoTMQTTClient, data: dict, message) -> None:
+    print("Received a new message: ")
+    print(message.payload)
+    print("from topic: ")
+    print(message.topic)
+    print("--------------\n\n")
+
+
+def get_mqtt_client() -> AWSIoTMQTTClient:
+    """Connect to Mqtt"""
+    mqtt_client = None
+    mqtt_client = AWSIoTMQTTClient(client_id)
+    mqtt_client.configureEndpoint(host, 8883)
+    mqtt_client.configureCredentials(root_ca_path, private_key_path, certificate_path)
+    mqtt_client.configureAutoReconnectBackoffTime(1, 32, 20)
+    mqtt_client.configureOfflinePublishQueueing(-1)  # Infinite offline Publish queueing
+    mqtt_client.configureDrainingFrequency(2)  # Draining: 2 Hz
+    mqtt_client.configureConnectDisconnectTimeout(10)  # 10 sec
+    mqtt_client.configureMQTTOperationTimeout(5)  # 5 sec
+    mqtt_client.connect()
+    return mqtt_client
+
+
+def send_message(client: AWSIoTMQTTClient, data: dict) -> None:
+    message_json = json.dumps(data)
+    client.publish(topic, message_json, 1)
+    
 # change these as desired - they're the pins connected from the
 # SPI port on the ADC to the Cobbler
 SPICLK = 11
@@ -67,35 +111,45 @@ def readadc(adcnum, clockpin, mosipin, misopin, cspin):
     
 #main loop
 def calculateRS(analogRead):
-    return (RL * ((1023 - analogRead) / analogRead))
+    try:
+        return (RL * ((1023 - analogRead) / analogRead))
+    except ZeroDivisionError:
+        print("---")
 
 def calculatePromRS(analogRead):
     rs = 0.0
     for i in range(100):
-        rs += calculateRS(analogRead)
+        try:
+            rs += calculateRS(analogRead)
+        except TypeError:
+            print("---")
     rs = rs/100
     return rs
 
 def obtainPPM(ratio_rs_ro, id_mq):
-    if id_mq == 0:
-        return (pow(10, ( (math.log(ratio_rs_ro)-MQ2Curve[1]) / MQ2Curve[2]) + MQ2Curve[0]))
-    elif id_mq == 1:
-        return (pow(10, ( (math.log(ratio_rs_ro)-MQ5Curve[1]) / MQ5Curve[2]) + MQ5Curve[0]))
-    elif id_mq == 2:
-        return (pow(10, ( (math.log(ratio_rs_ro)-MQ7Curve[1]) / MQ7Curve[2]) + MQ7Curve[0]))
-    elif id_mq == 3:
-        return (pow(10, ( (math.log(ratio_rs_ro)-MQ135Curve[1]) / MQ135Curve[2]) + MQ135Curve[0]))
-    else:
-        return 0
+    try:
+        if id_mq == 0:
+            return (pow(10, ( (math.log(ratio_rs_ro)-MQ2Curve[1]) / MQ2Curve[2]) + MQ2Curve[0]))
+        elif id_mq == 1:
+            return (pow(10, ( (math.log(ratio_rs_ro)-MQ5Curve[1]) / MQ5Curve[2]) + MQ5Curve[0]))
+        elif id_mq == 2:
+            return (pow(10, ( (math.log(ratio_rs_ro)-MQ7Curve[1]) / MQ7Curve[2]) + MQ7Curve[0]))
+        elif id_mq == 3:
+            return (pow(10, ( (math.log(ratio_rs_ro)-MQ135Curve[1]) / MQ135Curve[2]) + MQ135Curve[0]))
+        else:
+            return 0
+    except ValueError:
+        print("---")
     
 def main():
     init()
     print("Initializing")
     time.sleep(3)
+    f = open("lecturasPPM.txt", "+w")
     
     while True:
         # Using the DHT22 sensor
-        #humidity, temperature = Adafruit_DHT.read_retry(DHT_SENSOR, DHT_PIN)
+        humidity, temperature = Adafruit_DHT.read_retry(DHT_SENSOR, DHT_PIN)
         
         # This instances are the analogReads, in other words, their values are between 0 to 1023
         MQ2 = readadc(mq2_apin, SPICLK, SPIMOSI, SPIMISO, SPICS)
@@ -126,10 +180,31 @@ def main():
         print(datetime.datetime.now())
         print("***************************")
         
+        # Here we add the information in the text file
+        f.write("SMOKE: " + str(ppm_mq2) + " ppm")
+        f.write("LPG: " + str(ppm_mq5) + " ppm")
+        f.write("CO: " + str(ppm_mq7) + " ppm")
+        f.write("NH4: " + str(ppm_mq135) + " ppm")
+        f.write("***************************")
+        
+        message = {
+            "device": client_id,
+            "location": location,
+            "mq2": int(ppm_mq2),
+            "mq5": int(ppm_mq5),
+            "mq7": int(ppm_mq7),
+            "mq135": int(ppm_mq135),
+            "dht22": {"temperature": temperature, "humidity": humidity},
+            "issued_date": datetime.datetime.now().timestamp(),
+            "metadata": {"other": "value"},
+        }
+        send_message(client=mqtt_client, data=message)
+        print("Published topic %s: %s\n" % (topic, message))
+        
         time.sleep(1.0)
 
 # Each sensor (MQ2,5,7 and 135) has their own sensibility to a controlled area, this one is air. Also you can see the values on the datasheets
-air = [9.83, 6.50, 26.95, 3.65] #Used to calculate RO
+air = [9.83, 6.50, 26.95, 3.12] #Used to calculate RO
 
 MQ2Curve = [2.30,0.53,-0.44]
 MQ5Curve = [2.30,-0.15,-0.37]
@@ -141,12 +216,14 @@ MQ5ro = 10.36
 MQ7ro = 0.63
 MQ135ro = 19.37
 
-
 if __name__ =='__main__':
-         try:
-                  main()
-                  pass
-         except KeyboardInterrupt:
-                  pass
+    """Execute send payload."""
+    mqtt_client = get_mqtt_client()
+    try:
+        main()
+        f.close()
+        pass
+    except KeyboardInterrupt:
+        pass
 
 GPIO.cleanup()
